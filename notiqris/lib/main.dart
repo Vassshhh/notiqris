@@ -18,16 +18,14 @@ void main() async {
   runApp(const MyApp());
 }
 
-/// Inisialisasi background listener agar native dapat memanggil callback
 Future<void> _initBackgroundListener() async {
   await NotificationsListener.initialize(callbackHandle: notificationCallback);
 }
 
-/// Callback dari native Android (dijalankan di background isolate)
 @pragma('vm:entry-point')
 void notificationCallback(NotificationEvent event) {
   final port = IsolateNameServer.lookupPortByName('_notification_port');
-  port?.send(event); // kirim ke main isolate untuk diproses
+  port?.send(event);
 }
 
 class MyApp extends StatelessWidget {
@@ -73,16 +71,12 @@ class _AuthWrapperState extends State<AuthWrapper> {
 
   @override
   Widget build(BuildContext context) {
-    return Scaffold(
-      body: Center(
-        child: CircularProgressIndicator(),
-      ),
+    return const Scaffold(
+      body: Center(child: CircularProgressIndicator()),
     );
   }
 }
 
-
-/// Aplikasi utama
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
   @override
@@ -120,38 +114,73 @@ class _HomePageState extends State<HomePage> {
     });
   }
 
-/// Mendaftarkan ReceivePort untuk menerima event dari background isolate
-void _startListening() {
-  _receivePort = ReceivePort();
-  IsolateNameServer.registerPortWithName(
-    _receivePort!.sendPort,
-    '_notification_port',
-  );
+  void _startListening() {
+    _receivePort = ReceivePort();
+    IsolateNameServer.registerPortWithName(
+      _receivePort!.sendPort,
+      '_notification_port',
+    );
 
-  _receivePort!.listen((event) async {
-    if (event is NotificationEvent) {
-      setState(() {
-        _events.insert(0, event);
-      });
+    _receivePort!.listen((event) async {
+      if (event is! NotificationEvent) return;
 
-      final text = event.text?.toLowerCase() ?? '';
-      final keywords = ['qr', 'qris', 'rp', 'transaksi', 'transaction'];
+      debugPrint('===== NOTIFIKASI MASUK =====');
+      debugPrint('Package    : ${event.packageName}');
+      debugPrint('Title      : ${event.title}');
+      debugPrint('Text       : ${event.text}');
+      debugPrint('Extras     : ${event.raw}');
+      debugPrint('=============================');
 
-      // Cek apakah teks mengandung kata kunci
-      final containsKeyword = keywords.any((keyword) => text.contains(keyword));
-      if (!containsKeyword) return;
-
-      // Deteksi angka nominal dari teks (misal Rp12.500 atau 100.000,00)
-      final regex = RegExp(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)');
-      final match = regex.firstMatch(text);
-      String? value;
-
-      if (match != null) {
-        // Ambil angka dan hilangkan semua karakter non-digit
-        value = match.group(0)?.replaceAll(RegExp(r'[^\d]'), '');
+      final lines = extractLinesFromExtras(event.raw as Map<String, dynamic>?);
+      if (lines.isEmpty && event.text != null) {
+        lines.add(event.text!.trim());
       }
 
-      // Kirim ke server
+      final lower = lines.join(' ').toLowerCase();
+      final keywords = ['qr', 'qris', 'rp', 'transaksi', 'transaction'];
+      final containsKeyword = keywords.any((keyword) => lower.contains(keyword));
+      if (!containsKeyword) return;
+
+      final now = DateTime.now();
+      final timeLabel = '[${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}]';
+      final labeledLines = lines.map((e) => '$timeLabel $e').toList();
+      final fullText = labeledLines.join('\n');
+
+      setState(() {
+        final existingIndex = _events.indexWhere((e) =>
+            e.packageName == event.packageName &&
+            e.title == event.title);
+
+        if (existingIndex != -1) {
+          final existingEvent = _events[existingIndex];
+          final oldLines = (existingEvent.text ?? '').split('\n').toSet();
+          final newLines = labeledLines.toSet().difference(oldLines);
+          if (newLines.isNotEmpty) {
+            final mergedText = (oldLines.union(newLines)).join('\n');
+            _events[existingIndex] = NotificationEvent(
+              id: existingEvent.id,
+              packageName: existingEvent.packageName,
+              title: existingEvent.title,
+              text: mergedText,
+              timestamp: event.timestamp ?? existingEvent.timestamp,
+            );
+          }
+        } else {
+          _events.insert(0, NotificationEvent(
+            id: event.id,
+            packageName: event.packageName,
+            title: event.title,
+            text: fullText,
+            timestamp: event.timestamp,
+          ));
+        }
+      });
+
+      final regex = RegExp(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)');
+      final match = regex.firstMatch(lines.last);
+      String? value = match?.group(0)?.replaceAll(RegExp(r'[^\d]'), '');
+      if (value == null) return;
+
       try {
         final response = await http.post(
           Uri.parse('https://payment.kediritechnopark.com/receive'),
@@ -159,20 +188,27 @@ void _startListening() {
           body: jsonEncode({
             'package': event.packageName ?? '',
             'title': event.title ?? '',
-            'text': event.text ?? '',
+            'text': lines.join('\n'),
             'timestamp': event.timestamp ?? 0,
-            'value': value ?? '',
+            'value': value,
           }),
         );
-
         debugPrint('Sent to server: ${response.statusCode}');
         debugPrint('Response body: ${response.body}');
       } catch (e) {
         debugPrint('Error sending to server: $e');
       }
+    });
+  }
+
+  List<String> extractLinesFromExtras(Map<String, dynamic>? extras) {
+    if (extras == null) return [];
+    final linesRaw = extras['android.textLines'];
+    if (linesRaw is List) {
+      return linesRaw.map((e) => e.toString().trim()).where((e) => e.isNotEmpty).toList();
     }
-  });
-}
+    return [];
+  }
 
   Future<void> _checkRunning() async {
     final running = await NotificationsListener.isRunning;
@@ -209,10 +245,29 @@ void _startListening() {
   Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(title: const Text('Notification Listener')),
-      floatingActionButton: FloatingActionButton.extended(
-        onPressed: _toggleService,
-        label: Text(_serviceRunning ? 'STOP' : 'START'),
-        icon: Icon(_serviceRunning ? Icons.stop : Icons.play_arrow),
+      floatingActionButton: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          FloatingActionButton.extended(
+            onPressed: _toggleService,
+            label: Text(_serviceRunning ? 'STOP' : 'START'),
+            icon: Icon(_serviceRunning ? Icons.stop : Icons.play_arrow),
+          ),
+          const SizedBox(height: 12),
+          FloatingActionButton.extended(
+            onPressed: () {
+              debugPrint('===== SEMUA NOTIFIKASI =====');
+              for (final e in _events) {
+                debugPrint('📌 ${e.title} (${e.packageName})');
+                debugPrint(e.text ?? '');
+              }
+              debugPrint('============================');
+            },
+            label: const Text('Print All'),
+            icon: const Icon(Icons.bug_report),
+            backgroundColor: Colors.orange,
+          ),
+        ],
       ),
       body: _events.isEmpty
           ? const Center(child: Text('No notifications yet.'))
@@ -220,19 +275,41 @@ void _startListening() {
               itemCount: _events.length,
               itemBuilder: (_, i) {
                 final e = _events[i];
-                return ListTile(
-                  leading: CircleAvatar(
-                    child: Text(e.packageName?[0].toUpperCase() ?? '?'),
-                  ),
-                  title: Text(e.title ?? ''),
-                  subtitle: Text(e.text ?? ''),
-                  trailing: Text(
-                    e.timestamp != null
-                        ? DateTime.fromMillisecondsSinceEpoch(e.timestamp!)
-                            .toLocal()
-                            .toString()
-                            .substring(11, 19)
-                        : '',
+                final formattedTime = e.timestamp != null
+                    ? DateTime.fromMillisecondsSinceEpoch(e.timestamp!)
+                        .toLocal()
+                        .toString()
+                        .substring(11, 19)
+                    : '';
+                return Padding(
+                  padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        '${e.title ?? ''} (${e.packageName})',
+                        style: const TextStyle(fontWeight: FontWeight.bold),
+                      ),
+                      Container(
+                        margin: const EdgeInsets.only(top: 4),
+                        padding: const EdgeInsets.all(12),
+                        decoration: BoxDecoration(
+                          color: Colors.blue.shade50,
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: Text(
+                          e.text ?? '',
+                          style: const TextStyle(fontSize: 14),
+                        ),
+                      ),
+                      Align(
+                        alignment: Alignment.bottomRight,
+                        child: Text(
+                          formattedTime,
+                          style: const TextStyle(fontSize: 10, color: Colors.grey),
+                        ),
+                      ),
+                    ],
                   ),
                 );
               },
