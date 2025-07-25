@@ -5,9 +5,9 @@ import 'dart:ui';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:http/http.dart' as http;
 import 'package:flutter_notification_listener/flutter_notification_listener.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:http/http.dart' as http;
 import 'package:socket_io_client/socket_io_client.dart' as IO;
 
 import 'login_page.dart';
@@ -77,6 +77,36 @@ class _AuthWrapperState extends State<AuthWrapper> {
   }
 }
 
+class MyNotificationEvent extends NotificationEvent {
+  final dynamic rawData;
+
+  MyNotificationEvent({
+    required int id,
+    required String packageName,
+    required String title,
+    required String text,
+    int? timestamp,
+    this.rawData,
+  }) : super(
+          id: id,
+          packageName: packageName,
+          title: title,
+          text: text,
+          timestamp: timestamp,
+        );
+
+  factory MyNotificationEvent.fromNotificationEvent(NotificationEvent event) {
+    return MyNotificationEvent(
+      id: event.id!,
+      packageName: event.packageName!,
+      title: event.title!,
+      text: event.text!,
+      timestamp: event.timestamp,
+      rawData: event.raw,
+    );
+  }
+}
+
 class HomePage extends StatefulWidget {
   const HomePage({super.key});
   @override
@@ -85,22 +115,31 @@ class HomePage extends StatefulWidget {
 
 class _HomePageState extends State<HomePage> {
   bool _serviceRunning = false;
-  final List<NotificationEvent> _events = [];
+  final List<MyNotificationEvent> _events = [];
   ReceivePort? _receivePort;
   IO.Socket? socket;
 
   @override
   void initState() {
     super.initState();
-    _startListening();
     _checkRunning();
-    _connectToSocket();
+    _startListening();
+    _checkToken();
   }
 
-  Future<void> _connectToSocket() async {
+  Future<void> _checkToken() async {
     final prefs = await SharedPreferences.getInstance();
     final token = prefs.getString('token');
+    if (token != null) {
+      await _connectToSocket(token);
+    } else {
+      if (mounted) {
+        Navigator.of(context).pushReplacementNamed('/login');
+      }
+    }
+  }
 
+  Future<void> _connectToSocket(String token) async {
     socket = IO.io('https://payment.kediritechnopark.com', <String, dynamic>{
       'transports': ['websocket'],
       'autoConnect': false,
@@ -109,8 +148,12 @@ class _HomePageState extends State<HomePage> {
     socket!.connect();
 
     socket!.onConnect((_) {
-      print('connected');
+      print('Connected to socket.io');
       socket!.emit('sign', {'token': token, 'socket_id': socket!.id});
+    });
+
+    socket!.onError((err) {
+      print('Socket error: $err');
     });
   }
 
@@ -131,25 +174,47 @@ class _HomePageState extends State<HomePage> {
       debugPrint('Extras     : ${event.raw}');
       debugPrint('=============================');
 
-      final lines = extractLinesFromExtras(event.raw as Map<String, dynamic>?);
-      if (lines.isEmpty && event.text != null) {
-        lines.add(event.text!.trim());
-      }
-
-      final lower = lines.join(' ').toLowerCase();
-      final keywords = ['qr', 'qris', 'rp', 'transaksi', 'transaction'];
-      final containsKeyword = keywords.any((keyword) => lower.contains(keyword));
-      if (!containsKeyword) return;
-
       final now = DateTime.now();
       final timeLabel = '[${now.hour.toString().padLeft(2, '0')}:${now.minute.toString().padLeft(2, '0')}]';
-      final labeledLines = lines.map((e) => '$timeLabel $e').toList();
+      final Map<String, dynamic> rawDataMap = (event.raw is Map)
+          ? Map<String, dynamic>.from(event.raw as Map)
+          : {};
+      final extractedLines = extractLinesFromExtras(rawDataMap);
+      if (extractedLines.isEmpty && event.text != null) {
+        extractedLines.add(event.text!.trim());
+      }
+      final labeledLines = extractedLines.map((e) => '$timeLabel $e').toList();
       final fullText = labeledLines.join('\n');
+
+      // Cek apakah mengandung keyword dan kirim POST
+      final keywords = ['qr', 'qris', 'rp', 'transaksi', 'transaction'];
+      final matchesKeyword = extractedLines.any((line) =>
+          keywords.any((keyword) => line.toLowerCase().contains(keyword)));
+
+      if (matchesKeyword) {
+        final value = extractedLines.join(' ');
+        try {
+          final response = await http.post(
+            Uri.parse('https://payment.kediritechnopark.com/receive'),
+            headers: {'Content-Type': 'application/json'},
+            body: jsonEncode({
+              'package': event.packageName ?? '',
+              'title': event.title ?? '',
+              'text': extractedLines.join('\n'),
+              'timestamp': event.timestamp ?? 0,
+              'value': value,
+            }),
+          );
+
+          debugPrint('✅ Dikirim ke endpoint dengan status: ${response.statusCode}');
+        } catch (e) {
+          debugPrint('❌ Gagal kirim data: $e');
+        }
+      }
 
       setState(() {
         final existingIndex = _events.indexWhere((e) =>
-            e.packageName == event.packageName &&
-            e.title == event.title);
+            e.packageName == event.packageName && e.title == event.title);
 
         if (existingIndex != -1) {
           final existingEvent = _events[existingIndex];
@@ -157,47 +222,29 @@ class _HomePageState extends State<HomePage> {
           final newLines = labeledLines.toSet().difference(oldLines);
           if (newLines.isNotEmpty) {
             final mergedText = (oldLines.union(newLines)).join('\n');
-            _events[existingIndex] = NotificationEvent(
-              id: existingEvent.id,
-              packageName: existingEvent.packageName,
-              title: existingEvent.title,
+            _events[existingIndex] = MyNotificationEvent(
+              id: existingEvent.id ?? 0,
+              packageName: existingEvent.packageName ?? '',
+              title: existingEvent.title ?? '',
               text: mergedText,
               timestamp: event.timestamp ?? existingEvent.timestamp,
+              rawData: rawDataMap,
             );
           }
         } else {
-          _events.insert(0, NotificationEvent(
-            id: event.id,
-            packageName: event.packageName,
-            title: event.title,
-            text: fullText,
-            timestamp: event.timestamp,
-          ));
+          _events.insert(
+            0,
+            MyNotificationEvent(
+              id: event.id ?? 0,
+              packageName: event.packageName ?? '',
+              title: event.title ?? '',
+              text: fullText,
+              timestamp: event.timestamp,
+              rawData: rawDataMap,
+            ),
+          );
         }
       });
-
-      final regex = RegExp(r'(\d{1,3}(?:[.,]\d{3})*(?:[.,]\d{2})?)');
-      final match = regex.firstMatch(lines.last);
-      String? value = match?.group(0)?.replaceAll(RegExp(r'[^\d]'), '');
-      if (value == null) return;
-
-      try {
-        final response = await http.post(
-          Uri.parse('https://payment.kediritechnopark.com/receive'),
-          headers: {'Content-Type': 'application/json'},
-          body: jsonEncode({
-            'package': event.packageName ?? '',
-            'title': event.title ?? '',
-            'text': lines.join('\n'),
-            'timestamp': event.timestamp ?? 0,
-            'value': value,
-          }),
-        );
-        debugPrint('Sent to server: ${response.statusCode}');
-        debugPrint('Response body: ${response.body}');
-      } catch (e) {
-        debugPrint('Error sending to server: $e');
-      }
     });
   }
 
@@ -237,7 +284,7 @@ class _HomePageState extends State<HomePage> {
       IsolateNameServer.removePortNameMapping('_notification_port');
       _receivePort!.close();
     }
-    socket?.disconnect();
+    socket?.dispose();
     super.dispose();
   }
 
@@ -259,7 +306,8 @@ class _HomePageState extends State<HomePage> {
               debugPrint('===== SEMUA NOTIFIKASI =====');
               for (final e in _events) {
                 debugPrint('📌 ${e.title} (${e.packageName})');
-                debugPrint(e.text ?? '');
+                debugPrint('Text: ${e.text ?? ''}');
+                debugPrint('Raw: ${e.rawData ?? ''}');
               }
               debugPrint('============================');
             },
@@ -298,7 +346,7 @@ class _HomePageState extends State<HomePage> {
                           borderRadius: BorderRadius.circular(12),
                         ),
                         child: Text(
-                          e.text ?? '',
+                          '${e.text ?? ''}\nRaw Data: ${jsonEncode(e.rawData)}',
                           style: const TextStyle(fontSize: 14),
                         ),
                       ),
